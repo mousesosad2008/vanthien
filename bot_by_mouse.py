@@ -94,6 +94,9 @@ waiting_for_link: dict = {}
 # Admin state tracking for multi-step input
 admin_state: dict = {}
 
+# Admin simulation mode (to preview customer view)
+admin_simulate: bool = False
+
 
 # ── Keyboards ─────────────────────────────────────────────────────────────────
 
@@ -285,8 +288,9 @@ DNS_GUIDE_TEXT = (
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    global user_data
+    global user_data, admin_simulate
     user_data = load_data()
+    admin_simulate = False
 
     # ── Admin menu ──
     if user.id == ADMIN_CHAT_ID:
@@ -297,7 +301,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "Chọn chức năng bên dưới:\n\n"
             "🎁 <b>Cấp lượt kích hoạt</b> — Nhập ID user + số lượt\n"
             "🔍 <b>Xem thông tin user</b> — Xem lượt kích hoạt của user\n"
-            "📋 <b>Danh sách user</b> — Xem tất cả user đã đăng ký\n\n"
+            "📋 <b>Danh sách user</b> — Xem tất cả user đã đăng ký\n"
+            "👁️ <b>/gialap</b> — Xem giao diện phía khách hàng\n\n"
             "Bot cũng tự động nhận thông báo xác nhận từ người dùng.",
             parse_mode="HTML",
             reply_markup=kb_admin_menu(),
@@ -322,12 +327,43 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
+async def gialap(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin-only: simulate the customer view."""
+    user = update.effective_user
+    if user.id != ADMIN_CHAT_ID:
+        return
+
+    global user_data, admin_simulate
+    admin_simulate = True
+    admin_state.clear()
+    user_data = load_data()
+    u = get_user(user_data, user.id)
+    save_data(user_data)
+
+    if u["activated"]:
+        await update.message.reply_text(
+            "👁️ <b>[GIẢ LẬP] Giao diện khách hàng:</b>\n"
+            "━━━━━━━━━━━━━━━━━━━\n\n"
+            + text_welcome_vip(user, u["luot_kich"]),
+            parse_mode="HTML",
+            reply_markup=kb_main_vip(),
+        )
+    else:
+        await update.message.reply_text(
+            "👁️ <b>[GIẢ LẬP] Giao diện khách hàng (chưa kích hoạt):</b>\n"
+            "━━━━━━━━━━━━━━━━━━━\n\n"
+            + text_welcome_old(user),
+            parse_mode="HTML",
+            reply_markup=kb_main_old(),
+        )
+
+
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     uid  = user.id
 
-    # ── Admin text input (for multi-step flows) ──
-    if uid == ADMIN_CHAT_ID and admin_state.get("step"):
+    # ── Admin text input (for multi-step flows, only when NOT simulating) ──
+    if uid == ADMIN_CHAT_ID and admin_state.get("step") and not admin_simulate:
         await handle_admin_text(update, context)
         return
 
@@ -459,12 +495,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     data = query.data
 
     # ══════════════════════════════════════════════════════════════════════════
-    # ADMIN-ONLY BUTTONS
+    # ADMIN-ONLY BUTTONS (skip if admin is in simulation mode)
     # ══════════════════════════════════════════════════════════════════════════
 
     # ── Admin menu buttons ──
     if data == "admin_cap_luot":
-        if user.id != ADMIN_CHAT_ID:
+        if user.id != ADMIN_CHAT_ID or admin_simulate:
             return
         admin_state.clear()
         admin_state["step"] = "waiting_user_id"
@@ -476,7 +512,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     if data == "admin_xem_user":
-        if user.id != ADMIN_CHAT_ID:
+        if user.id != ADMIN_CHAT_ID or admin_simulate:
             return
         admin_state.clear()
         admin_state["step"] = "waiting_view_user_id"
@@ -488,7 +524,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     if data == "admin_list_users":
-        if user.id != ADMIN_CHAT_ID:
+        if user.id != ADMIN_CHAT_ID or admin_simulate:
             return
         admin_state.clear()
         user_data = load_data()
@@ -514,7 +550,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     if data == "admin_back_menu":
-        if user.id != ADMIN_CHAT_ID:
+        if user.id != ADMIN_CHAT_ID or admin_simulate:
             return
         admin_state.clear()
         await query.edit_message_text(
@@ -800,6 +836,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 def main() -> None:
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("gialap", gialap))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND,
