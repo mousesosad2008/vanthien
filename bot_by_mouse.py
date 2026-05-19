@@ -1,9 +1,14 @@
+"""
+Bot By Mouse — Unified Telegram Bot
+Gom tat ca chuc nang CSKH + Kiem Duyet vao 1 bot duy nhat.
+Chi admin (ADMIN_CHAT_ID) moi co quyen dieu chinh thong so.
+"""
+
 import os
 import json
-import asyncio
 import logging
 from datetime import datetime
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -20,9 +25,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── Environment Variables ─────────────────────────────────────────────────────
-CUSTOMER_CARE_BOT_TOKEN = os.environ.get("CUSTOMER_CARE_BOT_TOKEN", "")
-ADMIN_BOT_TOKEN         = os.environ.get("ADMIN_BOT_TOKEN", "")
-ADMIN_CHAT_ID           = int(os.environ.get("ADMIN_CHAT_ID", "6021515792"))
+BOT_TOKEN     = os.environ.get("BOT_TOKEN", "")
+ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", "6021515792"))
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 QR_URL = (
@@ -56,12 +60,6 @@ def save_data(data: dict) -> None:
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-def reload_user_data() -> dict:
-    """Reload user data from file (admin bot may have changed it)."""
-    global user_data
-    user_data = load_data()
-    return user_data
-
 def get_user(data: dict, user_id: int) -> dict:
     uid = str(user_id)
     if uid not in data:
@@ -78,11 +76,23 @@ def get_user(data: dict, user_id: int) -> dict:
         save_data(data)
     return data[uid]
 
+def activate_user(data: dict, user_id: int, package: str = "donate") -> dict:
+    u = get_user(data, user_id)
+    if not u["activated"]:
+        u["activated"] = True
+        u["luot_kich"] = DEFAULT_LUOT_KICH
+        u["month"] = datetime.now().strftime("%Y-%m")
+    save_data(data)
+    return u
+
 
 user_data = load_data()
 
 # Track users waiting to input link
-waiting_for_link = {}
+waiting_for_link: dict = {}
+
+# Admin state tracking for multi-step input
+admin_state: dict = {}
 
 
 # ── Keyboards ─────────────────────────────────────────────────────────────────
@@ -170,8 +180,15 @@ def kb_dns_after_activate() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("⬅️ Quay lại Menu", callback_data="back_vip")],
     ])
 
+def kb_admin_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎁 Cấp lượt kích hoạt", callback_data="admin_cap_luot")],
+        [InlineKeyboardButton("🔍 Xem thông tin user", callback_data="admin_xem_user")],
+        [InlineKeyboardButton("📋 Danh sách tất cả user", callback_data="admin_list_users")],
+    ])
 
-# ── Texts ─────────────────────────────────────────────────────────────────────
+
+# ── Text Templates ────────────────────────────────────────────────────────────
 
 def text_welcome_old(user) -> str:
     name = user.full_name or user.first_name or "Người dùng"
@@ -268,8 +285,28 @@ DNS_GUIDE_TEXT = (
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    reload_user_data()
+    global user_data
+    user_data = load_data()
+
+    # ── Admin menu ──
+    if user.id == ADMIN_CHAT_ID:
+        admin_state.clear()
+        u = get_user(user_data, user.id)
+        await update.message.reply_text(
+            "👋 <b>Bot By Mouse — Admin Panel</b>\n\n"
+            "Chọn chức năng bên dưới:\n\n"
+            "🎁 <b>Cấp lượt kích hoạt</b> — Nhập ID user + số lượt\n"
+            "🔍 <b>Xem thông tin user</b> — Xem lượt kích hoạt của user\n"
+            "📋 <b>Danh sách user</b> — Xem tất cả user đã đăng ký\n\n"
+            "Bot cũng tự động nhận thông báo xác nhận từ người dùng.",
+            parse_mode="HTML",
+            reply_markup=kb_admin_menu(),
+        )
+        return
+
+    # ── User menu ──
     u = get_user(user_data, user.id)
+    save_data(user_data)
 
     if u["activated"]:
         await update.message.reply_text(
@@ -289,6 +326,12 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     user = update.effective_user
     uid  = user.id
 
+    # ── Admin text input (for multi-step flows) ──
+    if uid == ADMIN_CHAT_ID and admin_state.get("step"):
+        await handle_admin_text(update, context)
+        return
+
+    # ── User link input ──
     if uid not in waiting_for_link:
         return
 
@@ -296,17 +339,12 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     action = waiting_for_link.pop(uid)
 
     if action == "activate":
-        try:
-            admin_bot = Bot(token=ADMIN_BOT_TOKEN)
-            await admin_bot.send_message(
-                chat_id=ADMIN_CHAT_ID,
-                text=text_notify_admin_link(user, link),
-                parse_mode="HTML",
-                reply_markup=kb_admin_activate_link(user.id),
-            )
-        except Exception as e:
-            logger.error(f"Admin bot error: {e}")
-
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=text_notify_admin_link(user, link),
+            parse_mode="HTML",
+            reply_markup=kb_admin_activate_link(user.id),
+        )
         await update.message.reply_text(
             "⏳ <b>Vui lòng chờ!</b>\n\n"
             "Link của bạn đã được gửi đến admin.\n"
@@ -316,17 +354,12 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
 
     elif action == "reactivate":
-        try:
-            admin_bot = Bot(token=ADMIN_BOT_TOKEN)
-            await admin_bot.send_message(
-                chat_id=ADMIN_CHAT_ID,
-                text=text_notify_admin_reactivate(user, link),
-                parse_mode="HTML",
-                reply_markup=kb_admin_reactivate_link(user.id),
-            )
-        except Exception as e:
-            logger.error(f"Admin bot error: {e}")
-
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=text_notify_admin_reactivate(user, link),
+            parse_mode="HTML",
+            reply_markup=kb_admin_reactivate_link(user.id),
+        )
         await update.message.reply_text(
             "⏳ <b>Vui lòng chờ!</b>\n\n"
             "Yêu cầu kích hoạt lại đã được gửi đến admin.\n"
@@ -336,15 +369,283 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
 
 
+async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle admin text input for multi-step flows."""
+    text = (update.message.text or "").strip()
+    if not text:
+        return
+
+    global user_data
+    step = admin_state.get("step")
+
+    if step == "waiting_user_id":
+        try:
+            target_id = int(text)
+        except ValueError:
+            await update.message.reply_text(
+                "❌ ID không hợp lệ. Vui lòng nhập ID dạng số (ví dụ: 6021515792):",
+                parse_mode="HTML",
+            )
+            return
+        admin_state["target_user_id"] = target_id
+        admin_state["step"] = "waiting_luot_kich"
+        await update.message.reply_text(
+            f"✅ ID user: <code>{target_id}</code>\n\n"
+            "Nhập <b>số lượt kích hoạt</b> muốn cấp cho user này:",
+            parse_mode="HTML",
+        )
+
+    elif step == "waiting_luot_kich":
+        try:
+            luot = int(text)
+            if luot < 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Số lượt không hợp lệ. Vui lòng nhập số nguyên >= 0:",
+                parse_mode="HTML",
+            )
+            return
+        target_id = admin_state["target_user_id"]
+        user_data = load_data()
+        u = get_user(user_data, target_id)
+        u["luot_kich"] = luot
+        save_data(user_data)
+        admin_state.clear()
+        await update.message.reply_text(
+            f"🎉 <b>Đã cấp {luot} lượt kích hoạt cho user</b> <code>{target_id}</code>!\n\n"
+            f"📌 Lượt kích hoạt hiện tại: <b>{luot}</b>",
+            parse_mode="HTML",
+            reply_markup=kb_admin_menu(),
+        )
+
+    elif step == "waiting_view_user_id":
+        try:
+            target_id = int(text)
+        except ValueError:
+            await update.message.reply_text(
+                "❌ ID không hợp lệ. Vui lòng nhập ID dạng số:",
+                parse_mode="HTML",
+            )
+            return
+        admin_state.clear()
+        user_data = load_data()
+        uid_str = str(target_id)
+        if uid_str in user_data:
+            u = user_data[uid_str]
+            await update.message.reply_text(
+                f"📋 <b>Thông tin user</b> <code>{target_id}</code>:\n\n"
+                f"✅ Đã kích hoạt: <b>{'Có' if u.get('activated') else 'Chưa'}</b>\n"
+                f"🔢 Lượt kích hoạt: <b>{u.get('luot_kich', 0)}</b>\n"
+                f"📅 Tháng: <b>{u.get('month', 'N/A')}</b>\n"
+                f"👤 Tên: <b>{u.get('name', 'N/A')}</b>",
+                parse_mode="HTML",
+                reply_markup=kb_admin_menu(),
+            )
+        else:
+            await update.message.reply_text(
+                f"❌ Không tìm thấy user <code>{target_id}</code> trong hệ thống.",
+                parse_mode="HTML",
+                reply_markup=kb_admin_menu(),
+            )
+
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
     user = query.from_user
 
-    # ── Old menu buttons (for non-activated users) ──
+    global user_data
+    data = query.data
 
-    if query.data in ("donate", "locket_vip"):
-        package = query.data
+    # ══════════════════════════════════════════════════════════════════════════
+    # ADMIN-ONLY BUTTONS
+    # ══════════════════════════════════════════════════════════════════════════
+
+    # ── Admin menu buttons ──
+    if data == "admin_cap_luot":
+        if user.id != ADMIN_CHAT_ID:
+            return
+        admin_state.clear()
+        admin_state["step"] = "waiting_user_id"
+        await query.edit_message_text(
+            "🎁 <b>Cấp lượt kích hoạt</b>\n\n"
+            "Nhập <b>ID Telegram</b> của user cần cấp lượt:",
+            parse_mode="HTML",
+        )
+        return
+
+    if data == "admin_xem_user":
+        if user.id != ADMIN_CHAT_ID:
+            return
+        admin_state.clear()
+        admin_state["step"] = "waiting_view_user_id"
+        await query.edit_message_text(
+            "🔍 <b>Xem thông tin user</b>\n\n"
+            "Nhập <b>ID Telegram</b> của user cần xem:",
+            parse_mode="HTML",
+        )
+        return
+
+    if data == "admin_list_users":
+        if user.id != ADMIN_CHAT_ID:
+            return
+        admin_state.clear()
+        user_data = load_data()
+        if not user_data:
+            await query.edit_message_text(
+                "📋 <b>Chưa có user nào trong hệ thống.</b>",
+                parse_mode="HTML",
+                reply_markup=kb_admin_menu(),
+            )
+            return
+        lines = ["📋 <b>Danh sách user:</b>\n"]
+        for uid, info in user_data.items():
+            status = "✅" if info.get("activated") else "❌"
+            luot = info.get("luot_kich", 0)
+            name = info.get("name", "")
+            display = f" ({name})" if name else ""
+            lines.append(f"{status} <code>{uid}</code>{display} — {luot} lượt")
+        await query.edit_message_text(
+            "\n".join(lines),
+            parse_mode="HTML",
+            reply_markup=kb_admin_menu(),
+        )
+        return
+
+    if data == "admin_back_menu":
+        if user.id != ADMIN_CHAT_ID:
+            return
+        admin_state.clear()
+        await query.edit_message_text(
+            "👋 <b>Bot By Mouse — Admin Panel</b>\n\n"
+            "Chọn chức năng bên dưới:",
+            parse_mode="HTML",
+            reply_markup=kb_admin_menu(),
+        )
+        return
+
+    # ── Admin confirm buttons (payment, activate, reactivate, extra) ──
+    if data.startswith("confirm:"):
+        if user.id != ADMIN_CHAT_ID:
+            return
+        parts = data.split(":")
+        customer_id = int(parts[1])
+        package = parts[2]
+        user_data = load_data()
+        activate_user(user_data, customer_id, package)
+        u = get_user(user_data, customer_id)
+        u["name"] = u.get("name", "")
+        save_data(user_data)
+        await query.edit_message_text(
+            f"✅ <b>Đã xác nhận thanh toán & kích hoạt!</b>\n\n"
+            f"🆔 Customer ID: <code>{customer_id}</code>\n"
+            f"📦 Gói: {PACKAGE_LABELS.get(package, package)}\n"
+            f"🔢 Lượt kích hoạt: <b>{u['luot_kich']}</b>",
+            parse_mode="HTML",
+            reply_markup=kb_admin_menu(),
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=customer_id,
+                text=(
+                    "🎉 <b>Tài khoản đã được kích hoạt!</b>\n\n"
+                    f"📦 Gói: {PACKAGE_LABELS.get(package, package)}\n"
+                    f"🔢 Lượt kích hoạt: <b>{u['luot_kich']}</b>\n\n"
+                    "Gửi /start để bắt đầu sử dụng!"
+                ),
+                parse_mode="HTML",
+                reply_markup=kb_dns_after_activate(),
+            )
+        except Exception as e:
+            logger.error(f"Cannot notify customer {customer_id}: {e}")
+        return
+
+    if data.startswith("confirm_link:"):
+        if user.id != ADMIN_CHAT_ID:
+            return
+        customer_id = int(data.split(":")[1])
+        await query.edit_message_text(
+            f"✅ <b>Đã xác nhận kích hoạt link!</b>\n"
+            f"🆔 Customer: <code>{customer_id}</code>",
+            parse_mode="HTML",
+            reply_markup=kb_admin_menu(),
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=customer_id,
+                text=(
+                    "🎉 <b>Link đã được kích hoạt thành công!</b>\n\n"
+                    "Cảm ơn bạn đã sử dụng dịch vụ! 🙏"
+                ),
+                parse_mode="HTML",
+                reply_markup=kb_dns_after_activate(),
+            )
+        except Exception as e:
+            logger.error(f"Cannot notify customer {customer_id}: {e}")
+        return
+
+    if data.startswith("confirm_reactivate:"):
+        if user.id != ADMIN_CHAT_ID:
+            return
+        customer_id = int(data.split(":")[1])
+        await query.edit_message_text(
+            f"✅ <b>Đã xác nhận kích hoạt lại!</b>\n"
+            f"🆔 Customer: <code>{customer_id}</code>",
+            parse_mode="HTML",
+            reply_markup=kb_admin_menu(),
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=customer_id,
+                text=(
+                    "🎉 <b>Tài khoản đã được kích hoạt lại thành công!</b>\n\n"
+                    "Cảm ơn bạn đã sử dụng dịch vụ! 🙏"
+                ),
+                parse_mode="HTML",
+                reply_markup=kb_dns_after_activate(),
+            )
+        except Exception as e:
+            logger.error(f"Cannot notify customer {customer_id}: {e}")
+        return
+
+    if data.startswith("confirm_extra:"):
+        if user.id != ADMIN_CHAT_ID:
+            return
+        customer_id = int(data.split(":")[1])
+        user_data = load_data()
+        u = get_user(user_data, customer_id)
+        u["luot_kich"] += 5
+        save_data(user_data)
+        await query.edit_message_text(
+            f"✅ <b>Đã xác nhận & cộng 5 lượt!</b>\n"
+            f"🆔 Customer: <code>{customer_id}</code>\n"
+            f"🔢 Lượt kích hoạt mới: <b>{u['luot_kich']}</b>",
+            parse_mode="HTML",
+            reply_markup=kb_admin_menu(),
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=customer_id,
+                text=(
+                    "🎉 <b>Đã cộng thêm 5 lượt kích hoạt!</b>\n\n"
+                    f"🔢 Lượt kích hoạt hiện tại: <b>{u['luot_kich']}</b>\n\n"
+                    "Cảm ơn bạn đã ủng hộ! 🙏"
+                ),
+                parse_mode="HTML",
+                reply_markup=kb_back_vip(),
+            )
+        except Exception as e:
+            logger.error(f"Cannot notify customer {customer_id}: {e}")
+        return
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # USER BUTTONS
+    # ══════════════════════════════════════════════════════════════════════════
+
+    # ── Old menu buttons (for non-activated users) ──
+    if data in ("donate", "locket_vip"):
+        package = data
         await query.edit_message_text(
             text=text_qr(package),
             parse_mode="HTML",
@@ -355,20 +656,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             caption="📲 Quét mã QR để thanh toán",
         )
 
-    elif query.data.startswith("paid:"):
-        package = query.data.split(":", 1)[1]
-
-        try:
-            admin_bot = Bot(token=ADMIN_BOT_TOKEN)
-            await admin_bot.send_message(
-                chat_id=ADMIN_CHAT_ID,
-                text=text_notify_admin(user, package),
-                parse_mode="HTML",
-                reply_markup=kb_admin_confirm(user.id, package),
-            )
-        except Exception as e:
-            logger.error(f"Admin bot error: {e}")
-
+    elif data.startswith("paid:"):
+        package = data.split(":", 1)[1]
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=text_notify_admin(user, package),
+            parse_mode="HTML",
+            reply_markup=kb_admin_confirm(user.id, package),
+        )
         await query.edit_message_text(
             text=(
                 "⏳ <b>Xin vui lòng chờ!</b>\n\n"
@@ -379,20 +674,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             reply_markup=kb_back(),
         )
 
-    elif query.data == "back":
+    elif data == "back":
         await query.edit_message_text(
             text=text_welcome_old(user),
             parse_mode="HTML",
             reply_markup=kb_main_old(),
         )
 
-    elif query.data == "doi_ngon_ngu":
+    elif data == "doi_ngon_ngu":
         await query.answer("Tính năng Đổi Ngôn Ngữ sắp ra mắt!", show_alert=True)
 
     # ── VIP menu buttons (for activated users) ──
-
-    elif query.data == "kich_hoat_link":
-        reload_user_data()
+    elif data == "kich_hoat_link":
+        user_data = load_data()
         u = get_user(user_data, user.id)
         if u["luot_kich"] > 0:
             u["luot_kich"] -= 1
@@ -420,7 +714,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 caption="📲 Quét mã QR để thanh toán 10k — mua 5 lượt kích hoạt",
             )
 
-    elif query.data == "cai_dns":
+    elif data == "cai_dns":
         await query.edit_message_text(
             DNS_GUIDE_TEXT,
             parse_mode="HTML",
@@ -433,8 +727,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     caption="🎬 Video hướng dẫn cài DNS",
                 )
 
-    elif query.data == "yeu_cau_kich_hoat_lai":
-        reload_user_data()
+    elif data == "yeu_cau_kich_hoat_lai":
+        user_data = load_data()
         u = get_user(user_data, user.id)
         if u["luot_kich"] > 0:
             u["luot_kich"] -= 1
@@ -462,7 +756,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 caption="📲 Quét mã QR để thanh toán 10k — mua 5 lượt kích hoạt",
             )
 
-    elif query.data == "mua_them_luot":
+    elif data == "mua_them_luot":
         await query.edit_message_text(
             "🛒 <b>Mua thêm lượt kích hoạt</b>\n\n"
             "Nạp <b>10k</b> để nhận thêm <b>5 lượt</b> kích hoạt.\n\n"
@@ -475,18 +769,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             caption="📲 Quét mã QR để thanh toán 10k — mua 5 lượt kích hoạt",
         )
 
-    elif query.data == "paid_extra":
-        try:
-            admin_bot = Bot(token=ADMIN_BOT_TOKEN)
-            await admin_bot.send_message(
-                chat_id=ADMIN_CHAT_ID,
-                text=text_notify_admin_extra_payment(user),
-                parse_mode="HTML",
-                reply_markup=kb_admin_confirm_extra(user.id),
-            )
-        except Exception as e:
-            logger.error(f"Admin bot error: {e}")
-
+    elif data == "paid_extra":
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=text_notify_admin_extra_payment(user),
+            parse_mode="HTML",
+            reply_markup=kb_admin_confirm_extra(user.id),
+        )
         await query.edit_message_text(
             "⏳ <b>Vui lòng chờ!</b>\n\n"
             "Thông tin thanh toán đã được gửi đến admin.\n"
@@ -495,9 +784,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             reply_markup=kb_back_vip(),
         )
 
-    elif query.data == "back_vip":
+    elif data == "back_vip":
         waiting_for_link.pop(user.id, None)
-        reload_user_data()
+        user_data = load_data()
         u = get_user(user_data, user.id)
         await query.edit_message_text(
             text_welcome_vip(user, u["luot_kich"]),
@@ -509,19 +798,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # ── Run ───────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    app = Application.builder().token(CUSTOMER_CARE_BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND, handle_text_message
-    ))
     app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND,
+        handle_text_message,
+    ))
 
-    logger.info("Bot CSKH is running...")
+    logger.info("Bot By Mouse is running...")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
-    if not CUSTOMER_CARE_BOT_TOKEN:
-        logger.error("Missing CUSTOMER_CARE_BOT_TOKEN environment variable.")
+    if not BOT_TOKEN:
+        logger.error("Missing BOT_TOKEN environment variable.")
     else:
         main()
